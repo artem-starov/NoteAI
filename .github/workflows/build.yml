@@ -1,0 +1,148 @@
+name: Build NoteAI APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Create Capacitor project
+        run: |
+          mkdir app && cd app
+          cat > package.json <<'EOF'
+          {
+            "name": "noteai-app",
+            "version": "1.5.0",
+            "private": true,
+            "dependencies": {
+              "@capacitor/android": "^7.0.0",
+              "@capacitor/app": "^7.0.0",
+              "@capacitor/cli": "^7.0.0",
+              "@capacitor/core": "^7.0.0",
+              "@capacitor/local-notifications": "^7.0.0"
+            }
+          }
+          EOF
+          cat > capacitor.config.json <<'EOF'
+          {
+            "appId": "com.noteai.app",
+            "appName": "NoteAI",
+            "webDir": "www",
+            "server": {
+              "url": "https://nouteai-prodject.web.app",
+              "androidScheme": "https",
+              "allowNavigation": ["nouteai-prodject.web.app", "*.firebaseapp.com", "*.googleapis.com"]
+            },
+            "android": { "backgroundColor": "#070b14" }
+          }
+          EOF
+          mkdir www
+          cat > www/index.html <<'EOF'
+          <!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>NoteAI</title></head><body style="background:#070b14;color:#e8f1ff;font-family:sans-serif;text-align:center;padding-top:30vh">NoteAI</body></html>
+          EOF
+          npm install
+          npx cap add android
+
+      - name: Customize app (icon, alarm sound, permissions)
+        working-directory: app
+        run: |
+          pip install pillow
+          python3 - <<'PY'
+          import math, struct, wave, os, shutil
+          from PIL import Image, ImageDraw, ImageFilter
+
+          # ---- alarm sound (about 20 seconds)
+          rate = 22050
+          buf = bytearray()
+          def tone(f, d):
+              n = int(rate * d)
+              for i in range(n):
+                  env = min(1.0, i / 200, (n - i) / 200)
+                  s = 1 if math.sin(2 * math.pi * f * i / rate) >= 0 else -1
+                  buf.extend(struct.pack('<h', int(32767 * 0.6 * env * s)))
+          def pause(d):
+              buf.extend(b'\x00\x00' * int(rate * d))
+          for _ in range(15):
+              for _ in range(3):
+                  tone(1000, 0.18)
+                  pause(0.1)
+              pause(0.5)
+          raw = 'android/app/src/main/res/raw'
+          os.makedirs(raw, exist_ok=True)
+          w = wave.open(raw + '/alarm.wav', 'wb')
+          w.setnchannels(1); w.setsampwidth(2); w.setframerate(rate)
+          w.writeframes(bytes(buf)); w.close()
+
+          # ---- icon
+          S = 1024
+          bg = Image.new('RGB', (S, S), (7, 11, 20))
+          grad = Image.new('RGB', (S, S))
+          px = grad.load()
+          for y in range(S):
+              for x in range(S):
+                  t = (x + y) / (2 * S - 2)
+                  px[x, y] = (int(25 + 230 * t), int(181 - 43 * t), int(255 - 224 * t))
+          mask = Image.new('L', (S, S), 0)
+          d = ImageDraw.Draw(mask)
+          u = S / 192 * 0.8
+          o = S * 0.1
+          P = lambda x, y: (o + x * u, o + y * u)
+          d.rounded_rectangle([*P(36, 28), *P(156, 164)], radius=int(14 * u), outline=255, width=int(10 * u))
+          for yy in (70, 96, 122):
+              d.line([*P(60, yy), *P(132, yy)], fill=255, width=int(7 * u))
+          glow = mask.filter(ImageFilter.GaussianBlur(S * 0.02)).point(lambda v: int(v * 0.55))
+          base = Image.composite(grad, bg, mask)
+          base = Image.composite(grad, Image.composite(grad, bg, glow), mask)
+          res = 'android/app/src/main/res'
+          for k, size in {'mdpi': 48, 'hdpi': 72, 'xhdpi': 96, 'xxhdpi': 144, 'xxxhdpi': 192}.items():
+              im = base.resize((size, size), Image.LANCZOS)
+              for name in ('ic_launcher.png', 'ic_launcher_round.png'):
+                  im.save(res + '/mipmap-' + k + '/' + name)
+          shutil.rmtree(res + '/mipmap-anydpi-v26', ignore_errors=True)
+
+          # ---- permissions for exact alarms, notifications and vibration
+          p = 'android/app/src/main/AndroidManifest.xml'
+          s = open(p, encoding='utf-8').read()
+          perms = ['POST_NOTIFICATIONS', 'VIBRATE', 'WAKE_LOCK', 'RECEIVE_BOOT_COMPLETED', 'USE_EXACT_ALARM', 'SCHEDULE_EXACT_ALARM', 'USE_FULL_SCREEN_INTENT']
+          add = ''.join('    <uses-permission android:name="android.permission.%s" />\n' % x for x in perms if 'permission.%s"' % x not in s)
+          s = s.replace('</manifest>', add + '</manifest>')
+          open(p, 'w', encoding='utf-8').write(s)
+          PY
+
+      - name: Build APK
+        working-directory: app
+        run: |
+          npx cap sync android
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NoteAI-apk
+          path: app/android/app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Prepare release file
+        run: cp app/android/app/build/outputs/apk/debug/app-debug.apk NoteAI.apk
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: NoteAI build ${{ github.run_number }}
+          files: NoteAI.apk
