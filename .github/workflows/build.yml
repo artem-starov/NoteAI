@@ -119,10 +119,459 @@ jobs:
           # ---- permissions for exact alarms, notifications and vibration
           p = 'android/app/src/main/AndroidManifest.xml'
           s = open(p, encoding='utf-8').read()
-          perms = ['POST_NOTIFICATIONS', 'VIBRATE', 'WAKE_LOCK', 'RECEIVE_BOOT_COMPLETED', 'USE_EXACT_ALARM', 'SCHEDULE_EXACT_ALARM', 'USE_FULL_SCREEN_INTENT']
+          perms = ['POST_NOTIFICATIONS', 'VIBRATE', 'WAKE_LOCK', 'RECEIVE_BOOT_COMPLETED', 'USE_EXACT_ALARM', 'SCHEDULE_EXACT_ALARM', 'USE_FULL_SCREEN_INTENT', 'SYSTEM_ALERT_WINDOW']
           add = ''.join('    <uses-permission android:name="android.permission.%s" />\n' % x for x in perms if 'permission.%s"' % x not in s)
           s = s.replace('</manifest>', add + '</manifest>')
           open(p, 'w', encoding='utf-8').write(s)
+          PY
+
+      - name: Add native alarm (full-screen alarm with vibration)
+        working-directory: app
+        run: |
+          python3 - <<'PY'
+          import re, glob, os
+
+          act = glob.glob('android/app/src/main/java/**/MainActivity.java', recursive=True)[0]
+          pkg = re.search(r'package\s+([\w.]+);', open(act, encoding='utf-8').read()).group(1)
+          out = os.path.dirname(act)
+
+          FILES = {}
+
+          FILES['MainActivity'] = r'''package %PKG%;
+
+          import android.os.Bundle;
+          import com.getcapacitor.BridgeActivity;
+
+          public class MainActivity extends BridgeActivity {
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  registerPlugin(AlarmPlugin.class);
+                  super.onCreate(savedInstanceState);
+              }
+          }
+          '''
+
+          FILES['AlarmStore'] = r'''package %PKG%;
+
+          import android.app.AlarmManager;
+          import android.app.PendingIntent;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import org.json.JSONArray;
+          import org.json.JSONObject;
+
+          public class AlarmStore {
+              static SharedPreferences prefs(Context c) {
+                  return c.getSharedPreferences("noteai_alarms", Context.MODE_PRIVATE);
+              }
+
+              static JSONArray load(Context c) {
+                  try {
+                      return new JSONArray(prefs(c).getString("list", "[]"));
+                  } catch (Exception e) {
+                      return new JSONArray();
+                  }
+              }
+
+              static void save(Context c, JSONArray a) {
+                  prefs(c).edit().putString("list", a.toString()).apply();
+              }
+
+              static PendingIntent pending(Context c, JSONObject o) {
+                  Intent i = new Intent(c, AlarmReceiver.class);
+                  i.putExtra("id", o.optInt("id"));
+                  i.putExtra("text", o.optString("text"));
+                  i.putExtra("title", o.optString("title"));
+                  i.putExtra("stop", o.optString("stop"));
+                  i.putExtra("snooze", o.optString("snooze"));
+                  return PendingIntent.getBroadcast(c, o.optInt("id"), i, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+              }
+
+              static void schedule(Context c, JSONObject o) {
+                  AlarmManager am = (AlarmManager) c.getSystemService(Context.ALARM_SERVICE);
+                  Intent open = new Intent(c, MainActivity.class);
+                  PendingIntent show = PendingIntent.getActivity(c, 0, open, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+                  am.setAlarmClock(new AlarmManager.AlarmClockInfo(o.optLong("at"), show), pending(c, o));
+              }
+
+              static void cancel(Context c, JSONObject o) {
+                  AlarmManager am = (AlarmManager) c.getSystemService(Context.ALARM_SERVICE);
+                  am.cancel(pending(c, o));
+              }
+
+              static void add(Context c, JSONObject o) {
+                  try {
+                      JSONArray old = load(c);
+                      JSONArray n = new JSONArray();
+                      for (int k = 0; k < old.length(); k++) {
+                          JSONObject x = old.getJSONObject(k);
+                          if (x.optInt("id") != o.optInt("id")) n.put(x);
+                      }
+                      o.put("keep", true);
+                      n.put(o);
+                      save(c, n);
+                      schedule(c, o);
+                  } catch (Exception e) {
+                  }
+              }
+
+              static void syncList(Context c, JSONArray fresh) {
+                  try {
+                      JSONArray old = load(c);
+                      JSONArray n = new JSONArray();
+                      for (int k = 0; k < old.length(); k++) {
+                          JSONObject x = old.getJSONObject(k);
+                          if (x.optBoolean("keep")) {
+                              n.put(x);
+                          } else {
+                              cancel(c, x);
+                          }
+                      }
+                      for (int k = 0; k < fresh.length(); k++) {
+                          JSONObject o = fresh.getJSONObject(k);
+                          schedule(c, o);
+                          n.put(o);
+                      }
+                      save(c, n);
+                  } catch (Exception e) {
+                  }
+              }
+
+              static void remove(Context c, int id) {
+                  try {
+                      JSONArray old = load(c);
+                      JSONArray n = new JSONArray();
+                      for (int k = 0; k < old.length(); k++) {
+                          JSONObject x = old.getJSONObject(k);
+                          if (x.optInt("id") != id) n.put(x);
+                      }
+                      save(c, n);
+                  } catch (Exception e) {
+                  }
+              }
+
+              static void restore(Context c) {
+                  try {
+                      JSONArray a = load(c);
+                      long now = System.currentTimeMillis();
+                      for (int k = 0; k < a.length(); k++) {
+                          JSONObject x = a.getJSONObject(k);
+                          if (x.optLong("at") > now) schedule(c, x);
+                      }
+                  } catch (Exception e) {
+                  }
+              }
+          }
+          '''
+
+          FILES['BootReceiver'] = r'''package %PKG%;
+
+          import android.content.BroadcastReceiver;
+          import android.content.Context;
+          import android.content.Intent;
+
+          public class BootReceiver extends BroadcastReceiver {
+              @Override
+              public void onReceive(Context c, Intent i) {
+                  AlarmStore.restore(c);
+              }
+          }
+          '''
+
+          FILES['AlarmReceiver'] = r'''package %PKG%;
+
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.content.BroadcastReceiver;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.media.AudioAttributes;
+          import android.net.Uri;
+          import android.os.Build;
+
+          public class AlarmReceiver extends BroadcastReceiver {
+              @Override
+              public void onReceive(Context c, Intent in) {
+                  int id = in.getIntExtra("id", 0);
+                  AlarmStore.remove(c, id);
+
+                  Intent a = new Intent(c, AlarmActivity.class);
+                  a.putExtras(in);
+                  a.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+
+                  Uri sound = Uri.parse("android.resource://" + c.getPackageName() + "/raw/alarm");
+                  long[] vib = new long[]{0, 600, 300, 600, 300, 600};
+                  NotificationManager nm = (NotificationManager) c.getSystemService(Context.NOTIFICATION_SERVICE);
+                  String chId = "noteai_alarm";
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      NotificationChannel nc = new NotificationChannel(chId, "NoteAI alarm", NotificationManager.IMPORTANCE_HIGH);
+                      nc.setSound(sound, new AudioAttributes.Builder()
+                              .setUsage(AudioAttributes.USAGE_ALARM)
+                              .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                              .build());
+                      nc.enableVibration(true);
+                      nc.setVibrationPattern(vib);
+                      nm.createNotificationChannel(nc);
+                  }
+                  PendingIntent pi = PendingIntent.getActivity(c, id, a, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+                  Notification.Builder b = Build.VERSION.SDK_INT >= 26 ? new Notification.Builder(c, chId) : new Notification.Builder(c);
+                  b.setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
+                          .setContentTitle(in.getStringExtra("title"))
+                          .setContentText(in.getStringExtra("text"))
+                          .setCategory(Notification.CATEGORY_ALARM)
+                          .setFullScreenIntent(pi, true)
+                          .setContentIntent(pi)
+                          .setAutoCancel(true);
+                  if (Build.VERSION.SDK_INT < 26) {
+                      b.setPriority(Notification.PRIORITY_MAX).setSound(sound).setVibrate(vib);
+                  }
+                  nm.notify(id, b.build());
+
+                  try {
+                      c.startActivity(a);
+                  } catch (Exception e) {
+                      // without the overlay permission the full-screen notification above is used
+                  }
+              }
+          }
+          '''
+
+          FILES['AlarmActivity'] = r'''package %PKG%;
+
+          import android.app.Activity;
+          import android.app.NotificationManager;
+          import android.content.Context;
+          import android.graphics.Color;
+          import android.graphics.Typeface;
+          import android.media.AudioAttributes;
+          import android.media.MediaPlayer;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.VibrationEffect;
+          import android.os.Vibrator;
+          import android.view.Gravity;
+          import android.view.WindowManager;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.TextView;
+          import java.text.DateFormat;
+          import java.util.Date;
+          import org.json.JSONObject;
+
+          public class AlarmActivity extends Activity {
+              private MediaPlayer mp;
+              private Vibrator vib;
+              private int id;
+
+              private int dp(int v) {
+                  return (int) (v * getResources().getDisplayMetrics().density);
+              }
+
+              private String nz(String s, String d) {
+                  return (s == null || s.length() == 0) ? d : s;
+              }
+
+              private TextView label(String t, int sp, String color, boolean bold) {
+                  TextView v = new TextView(this);
+                  v.setText(t);
+                  v.setTextSize(sp);
+                  v.setTextColor(Color.parseColor(color));
+                  v.setGravity(Gravity.CENTER);
+                  if (bold) v.setTypeface(Typeface.DEFAULT_BOLD);
+                  return v;
+              }
+
+              private Button button(String t, String bg, String fg) {
+                  Button b = new Button(this);
+                  b.setText(t);
+                  b.setTextSize(18);
+                  b.setAllCaps(false);
+                  b.setTextColor(Color.parseColor(fg));
+                  b.setBackgroundColor(Color.parseColor(bg));
+                  LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(64));
+                  lp.topMargin = dp(16);
+                  b.setLayoutParams(lp);
+                  return b;
+              }
+
+              @Override
+              protected void onCreate(Bundle s) {
+                  super.onCreate(s);
+                  if (Build.VERSION.SDK_INT >= 27) {
+                      setShowWhenLocked(true);
+                      setTurnScreenOn(true);
+                  }
+                  getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+                          | WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED
+                          | WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
+                          | WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD);
+
+                  id = getIntent().getIntExtra("id", 0);
+                  final String text = nz(getIntent().getStringExtra("text"), "");
+                  final String title = nz(getIntent().getStringExtra("title"), "!");
+                  final String stop = nz(getIntent().getStringExtra("stop"), "OK");
+                  final String snooze = nz(getIntent().getStringExtra("snooze"), "+5");
+                  ((NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE)).cancel(id);
+
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setGravity(Gravity.CENTER);
+                  root.setBackgroundColor(Color.parseColor("#070b14"));
+                  root.setPadding(dp(24), dp(24), dp(24), dp(24));
+                  root.addView(label("\u23F0", 72, "#ffffff", false));
+                  root.addView(label(title, 40, "#ff8a1f", true));
+                  root.addView(label(text, 22, "#e8f1ff", false));
+                  root.addView(label(DateFormat.getTimeInstance(DateFormat.SHORT).format(new Date()), 16, "#7f8fb0", false));
+                  Button stopBtn = button(stop, "#19b5ff", "#06101f");
+                  Button snoozeBtn = button(snooze, "#131c30", "#e8f1ff");
+                  root.addView(stopBtn);
+                  root.addView(snoozeBtn);
+                  setContentView(root);
+
+                  stopBtn.setOnClickListener(v -> {
+                      stopAll();
+                      finish();
+                  });
+                  snoozeBtn.setOnClickListener(v -> {
+                      try {
+                          JSONObject o = new JSONObject();
+                          o.put("id", id);
+                          o.put("at", System.currentTimeMillis() + 300000L);
+                          o.put("text", text);
+                          o.put("title", title);
+                          o.put("stop", stop);
+                          o.put("snooze", snooze);
+                          AlarmStore.add(this, o);
+                      } catch (Exception e) {
+                      }
+                      stopAll();
+                      finish();
+                  });
+
+                  startSound();
+                  startVibrate();
+              }
+
+              private void startSound() {
+                  try {
+                      mp = new MediaPlayer();
+                      mp.setAudioAttributes(new AudioAttributes.Builder()
+                              .setUsage(AudioAttributes.USAGE_ALARM)
+                              .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                              .build());
+                      mp.setDataSource(getApplicationContext(), Uri.parse("android.resource://" + getPackageName() + "/raw/alarm"));
+                      mp.setLooping(true);
+                      mp.prepare();
+                      mp.start();
+                  } catch (Exception e) {
+                  }
+              }
+
+              private void startVibrate() {
+                  try {
+                      vib = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
+                      long[] p = new long[]{0, 600, 300, 600, 300, 600, 1000};
+                      if (vib != null) {
+                          if (Build.VERSION.SDK_INT >= 26) {
+                              vib.vibrate(VibrationEffect.createWaveform(p, 0),
+                                      new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_ALARM).build());
+                          } else {
+                              vib.vibrate(p, 0);
+                          }
+                      }
+                  } catch (Exception e) {
+                  }
+              }
+
+              private void stopAll() {
+                  try {
+                      if (mp != null) {
+                          mp.stop();
+                          mp.release();
+                          mp = null;
+                      }
+                  } catch (Exception e) {
+                  }
+                  try {
+                      if (vib != null) vib.cancel();
+                  } catch (Exception e) {
+                  }
+              }
+
+              @Override
+              protected void onDestroy() {
+                  stopAll();
+                  super.onDestroy();
+              }
+          }
+          '''
+
+          FILES['AlarmPlugin'] = r'''package %PKG%;
+
+          import android.content.Intent;
+          import android.net.Uri;
+          import android.provider.Settings;
+          import com.getcapacitor.JSArray;
+          import com.getcapacitor.JSObject;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+
+          @CapacitorPlugin(name = "NativeAlarm")
+          public class AlarmPlugin extends Plugin {
+              @PluginMethod
+              public void sync(PluginCall call) {
+                  JSArray arr = call.getArray("alarms");
+                  if (arr != null) AlarmStore.syncList(getContext(), arr);
+                  call.resolve();
+              }
+
+              @PluginMethod
+              public void add(PluginCall call) {
+                  AlarmStore.add(getContext(), call.getData());
+                  call.resolve();
+              }
+
+              @PluginMethod
+              public void hasOverlay(PluginCall call) {
+                  JSObject r = new JSObject();
+                  r.put("value", Settings.canDrawOverlays(getContext()));
+                  call.resolve(r);
+              }
+
+              @PluginMethod
+              public void requestOverlay(PluginCall call) {
+                  Intent i = new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + getContext().getPackageName()));
+                  i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                  getContext().startActivity(i);
+                  call.resolve();
+              }
+          }
+          '''
+
+          for name, code in FILES.items():
+              open(os.path.join(out, name + '.java'), 'w', encoding='utf-8').write(code.replace('%PKG%', pkg))
+
+          p = 'android/app/src/main/AndroidManifest.xml'
+          m = open(p, encoding='utf-8').read()
+          extra = '''
+                  <receiver android:name="%PKG%.AlarmReceiver" android:exported="false" />
+                  <receiver android:name="%PKG%.BootReceiver" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.BOOT_COMPLETED" />
+                      </intent-filter>
+                  </receiver>
+                  <activity android:name="%PKG%.AlarmActivity" android:exported="false" android:excludeFromRecents="true" android:showWhenLocked="true" android:turnScreenOn="true" android:theme="@android:style/Theme.Material.NoActionBar" />
+          '''.replace('%PKG%', pkg)
+          if 'AlarmReceiver' not in m:
+              m = m.replace('</application>', extra + '    </application>')
+          open(p, 'w', encoding='utf-8').write(m)
+          print('native alarm files written for package', pkg)
           PY
 
       - name: Build APK
