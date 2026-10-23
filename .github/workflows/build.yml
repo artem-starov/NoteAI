@@ -33,6 +33,7 @@ jobs:
             "dependencies": {
               "@capacitor/android": "^7.0.0",
               "@capacitor/app": "^7.0.0",
+              "@capacitor/browser": "^7.0.0",
               "@capacitor/cli": "^7.0.0",
               "@capacitor/core": "^7.0.0",
               "@capacitor/local-notifications": "^7.0.0"
@@ -61,10 +62,12 @@ jobs:
 
       - name: Customize app (icon, alarm sound, permissions)
         working-directory: app
+        env:
+          RUN_NUMBER: ${{ github.run_number }}
         run: |
           pip install pillow
           python3 - <<'PY'
-          import math, struct, wave, os, shutil
+          import math, struct, wave, os, shutil, re
           from PIL import Image, ImageDraw, ImageFilter
 
           # ---- alarm sound (about 20 seconds)
@@ -115,6 +118,15 @@ jobs:
               for name in ('ic_launcher.png', 'ic_launcher_round.png'):
                   im.save(res + '/mipmap-' + k + '/' + name)
           shutil.rmtree(res + '/mipmap-anydpi-v26', ignore_errors=True)
+
+          # ---- app version (used by the in-app update check)
+          g = 'android/app/build.gradle'
+          t = open(g, encoding='utf-8').read()
+          run = os.environ.get('RUN_NUMBER', '1')
+          t2 = re.sub(r'versionCode\s+\d+', 'versionCode ' + run, t)
+          t2 = re.sub(r'versionName\s+"[^"]*"', 'versionName "1.' + run + '"', t2)
+          open(g, 'w', encoding='utf-8').write(t2)
+          print('versionCode set to ' + run if t2 != t else 'WARNING: versionCode was not changed')
 
           # ---- permissions for exact alarms, notifications and vibration
           p = 'android/app/src/main/AndroidManifest.xml'
@@ -573,6 +585,18 @@ jobs:
           open(p, 'w', encoding='utf-8').write(m)
           print('native alarm files written for package', pkg)
           PY
+
+      - name: Use fixed signing key (so updates install over old versions)
+        env:
+          KS: ${{ secrets.DEBUG_KEYSTORE_B64 }}
+        run: |
+          if [ -n "$KS" ]; then
+            mkdir -p ~/.android
+            echo "$KS" | base64 -d > ~/.android/debug.keystore
+            echo "Fixed signing key installed"
+          else
+            echo "No DEBUG_KEYSTORE_B64 secret: using a temporary key"
+          fi
 
       - name: Build APK
         working-directory: app
