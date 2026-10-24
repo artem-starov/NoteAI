@@ -73,19 +73,19 @@ jobs:
           # ---- alarm sound (about 20 seconds)
           rate = 22050
           buf = bytearray()
-          def tone(f, d):
+          def bell(f, d, vol=0.5):
               n = int(rate * d)
               for i in range(n):
-                  env = min(1.0, i / 200, (n - i) / 200)
-                  s = 1 if math.sin(2 * math.pi * f * i / rate) >= 0 else -1
-                  buf.extend(struct.pack('<h', int(32767 * 0.6 * env * s)))
+                  t = i / rate
+                  env = min(1.0, i / 300) * math.exp(-3.2 * t / d)
+                  v = (math.sin(2 * math.pi * f * t) + 0.35 * math.sin(4 * math.pi * f * t) + 0.12 * math.sin(6 * math.pi * f * t)) / 1.47
+                  buf.extend(struct.pack('<h', int(32767 * vol * env * v)))
           def pause(d):
               buf.extend(b'\x00\x00' * int(rate * d))
-          for _ in range(15):
-              for _ in range(3):
-                  tone(1000, 0.18)
-                  pause(0.1)
-              pause(0.5)
+          for _ in range(6):
+              for f in (523.25, 659.25, 783.99, 1046.5):
+                  bell(f, 0.6)
+              pause(1.4)
           raw = 'android/app/src/main/res/raw'
           os.makedirs(raw, exist_ok=True)
           w = wave.open(raw + '/alarm.wav', 'wb')
@@ -131,7 +131,7 @@ jobs:
           # ---- permissions for exact alarms, notifications and vibration
           p = 'android/app/src/main/AndroidManifest.xml'
           s = open(p, encoding='utf-8').read()
-          perms = ['POST_NOTIFICATIONS', 'VIBRATE', 'WAKE_LOCK', 'RECEIVE_BOOT_COMPLETED', 'USE_EXACT_ALARM', 'SCHEDULE_EXACT_ALARM', 'USE_FULL_SCREEN_INTENT', 'SYSTEM_ALERT_WINDOW']
+          perms = ['POST_NOTIFICATIONS', 'VIBRATE', 'WAKE_LOCK', 'RECEIVE_BOOT_COMPLETED', 'USE_EXACT_ALARM', 'SCHEDULE_EXACT_ALARM', 'USE_FULL_SCREEN_INTENT', 'SYSTEM_ALERT_WINDOW', 'FOREGROUND_SERVICE', 'FOREGROUND_SERVICE_MEDIA_PLAYBACK', 'REQUEST_IGNORE_BATTERY_OPTIMIZATIONS']
           add = ''.join('    <uses-permission android:name="android.permission.%s" />\n' % x for x in perms if 'permission.%s"' % x not in s)
           s = s.replace('</manifest>', add + '</manifest>')
           open(p, 'w', encoding='utf-8').write(s)
@@ -293,60 +293,277 @@ jobs:
 
           FILES['AlarmReceiver'] = r'''package %PKG%;
 
-          import android.app.Notification;
-          import android.app.NotificationChannel;
-          import android.app.NotificationManager;
-          import android.app.PendingIntent;
           import android.content.BroadcastReceiver;
           import android.content.Context;
           import android.content.Intent;
-          import android.media.AudioAttributes;
-          import android.net.Uri;
           import android.os.Build;
 
           public class AlarmReceiver extends BroadcastReceiver {
               @Override
               public void onReceive(Context c, Intent in) {
-                  int id = in.getIntExtra("id", 0);
-                  AlarmStore.remove(c, id);
+                  AlarmStore.remove(c, in.getIntExtra("id", 0));
+                  Intent s = new Intent(c, AlarmService.class);
+                  s.putExtras(in);
+                  try {
+                      if (Build.VERSION.SDK_INT >= 26) {
+                          c.startForegroundService(s);
+                      } else {
+                          c.startService(s);
+                      }
+                  } catch (Exception e) {
+                      try {
+                          Intent a = new Intent(c, AlarmActivity.class);
+                          a.putExtras(in);
+                          a.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                          c.startActivity(a);
+                      } catch (Exception e2) {
+                      }
+                  }
+              }
+          }
+          '''
 
-                  Intent a = new Intent(c, AlarmActivity.class);
-                  a.putExtras(in);
+          FILES['AlarmService'] = r'''package %PKG%;
+
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.app.Service;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.pm.ServiceInfo;
+          import android.media.AudioAttributes;
+          import android.media.MediaPlayer;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Handler;
+          import android.os.IBinder;
+          import android.os.Looper;
+          import android.os.PowerManager;
+          import android.os.VibrationEffect;
+          import android.os.Vibrator;
+          import org.json.JSONObject;
+
+          public class AlarmService extends Service {
+              static final String ACT_STOP = "noteai.STOP";
+              static final String ACT_SNOOZE = "noteai.SNOOZE";
+
+              private MediaPlayer mp;
+              private Vibrator vib;
+              private PowerManager.WakeLock wl;
+              private final Handler h = new Handler(Looper.getMainLooper());
+              private float vol = 0.25f;
+              private boolean running = false;
+              private int id;
+              private String text;
+              private String title;
+              private String stop;
+              private String snooze;
+
+              private final Runnable ramp = new Runnable() {
+                  @Override
+                  public void run() {
+                      if (mp == null) return;
+                      vol = Math.min(1f, vol + 0.1f);
+                      try {
+                          mp.setVolume(vol, vol);
+                      } catch (Exception e) {
+                      }
+                      if (vol < 1f) h.postDelayed(this, 1500);
+                  }
+              };
+
+              private final Runnable autoStop = new Runnable() {
+                  @Override
+                  public void run() {
+                      finishAlarm();
+                  }
+              };
+
+              @Override
+              public IBinder onBind(Intent i) {
+                  return null;
+              }
+
+              private Intent withData(Intent i) {
+                  i.putExtra("id", id);
+                  i.putExtra("text", text);
+                  i.putExtra("title", title);
+                  i.putExtra("stop", stop);
+                  i.putExtra("snooze", snooze);
+                  return i;
+              }
+
+              private Intent activityIntent() {
+                  Intent a = withData(new Intent(this, AlarmActivity.class));
                   a.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                  return a;
+              }
 
-                  Uri sound = Uri.parse("android.resource://" + c.getPackageName() + "/raw/alarm");
-                  long[] vib = new long[]{0, 600, 300, 600, 300, 600};
-                  NotificationManager nm = (NotificationManager) c.getSystemService(Context.NOTIFICATION_SERVICE);
-                  String chId = "noteai_alarm";
-                  if (Build.VERSION.SDK_INT >= 26) {
-                      NotificationChannel nc = new NotificationChannel(chId, "NoteAI alarm", NotificationManager.IMPORTANCE_HIGH);
-                      nc.setSound(sound, new AudioAttributes.Builder()
+              private Notification buildNotification() {
+                  NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+                  String ch = "noteai_alarm_svc";
+                  if (Build.VERSION.SDK_INT >= 26 && nm.getNotificationChannel(ch) == null) {
+                      NotificationChannel nc = new NotificationChannel(ch, "NoteAI alarm", NotificationManager.IMPORTANCE_HIGH);
+                      nc.setSound(null, null);
+                      nc.enableVibration(false);
+                      nc.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
+                      nm.createNotificationChannel(nc);
+                  }
+                  int fl = PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE;
+                  PendingIntent fs = PendingIntent.getActivity(this, 1, activityIntent(), fl);
+                  PendingIntent stopPi = PendingIntent.getService(this, 2, withData(new Intent(this, AlarmService.class).setAction(ACT_STOP)), fl);
+                  PendingIntent snzPi = PendingIntent.getService(this, 3, withData(new Intent(this, AlarmService.class).setAction(ACT_SNOOZE)), fl);
+                  Notification.Builder b = Build.VERSION.SDK_INT >= 26 ? new Notification.Builder(this, ch) : new Notification.Builder(this);
+                  b.setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
+                          .setContentTitle(title)
+                          .setContentText(text)
+                          .setCategory(Notification.CATEGORY_ALARM)
+                          .setOngoing(true)
+                          .setFullScreenIntent(fs, true)
+                          .setContentIntent(fs)
+                          .addAction(0, stop, stopPi)
+                          .addAction(0, snooze, snzPi);
+                  if (Build.VERSION.SDK_INT < 26) b.setPriority(Notification.PRIORITY_MAX);
+                  return b.build();
+              }
+
+              @Override
+              public int onStartCommand(Intent in, int flags, int startId) {
+                  if (in == null) {
+                      stopSelf();
+                      return START_NOT_STICKY;
+                  }
+                  String act = in.getAction();
+                  if (ACT_STOP.equals(act)) {
+                      finishAlarm();
+                      return START_NOT_STICKY;
+                  }
+                  if (ACT_SNOOZE.equals(act)) {
+                      snoozeFrom(in);
+                      finishAlarm();
+                      return START_NOT_STICKY;
+                  }
+
+                  id = in.getIntExtra("id", 0);
+                  text = in.getStringExtra("text");
+                  title = in.getStringExtra("title");
+                  stop = in.getStringExtra("stop");
+                  snooze = in.getStringExtra("snooze");
+                  if (title == null) title = "!";
+                  if (text == null) text = "";
+                  if (stop == null) stop = "OK";
+                  if (snooze == null) snooze = "+5";
+
+                  int nid = id == 0 ? 1 : id;
+                  if (Build.VERSION.SDK_INT >= 29) {
+                      startForeground(nid, buildNotification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
+                  } else {
+                      startForeground(nid, buildNotification());
+                  }
+                  if (!running) {
+                      running = true;
+                      wake();
+                      startSound();
+                      startVibrate();
+                      h.postDelayed(autoStop, 300000L);
+                  }
+                  try {
+                      startActivity(activityIntent());
+                  } catch (Exception e) {
+                  }
+                  return START_NOT_STICKY;
+              }
+
+              private void wake() {
+                  try {
+                      PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+                      wl = pm.newWakeLock(PowerManager.FULL_WAKE_LOCK | PowerManager.ACQUIRE_CAUSES_WAKEUP | PowerManager.ON_AFTER_RELEASE, "noteai:alarm");
+                      wl.acquire(60000L);
+                  } catch (Exception e) {
+                  }
+              }
+
+              private void startSound() {
+                  try {
+                      mp = new MediaPlayer();
+                      mp.setAudioAttributes(new AudioAttributes.Builder()
                               .setUsage(AudioAttributes.USAGE_ALARM)
                               .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
                               .build());
-                      nc.enableVibration(true);
-                      nc.setVibrationPattern(vib);
-                      nm.createNotificationChannel(nc);
-                  }
-                  PendingIntent pi = PendingIntent.getActivity(c, id, a, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
-                  Notification.Builder b = Build.VERSION.SDK_INT >= 26 ? new Notification.Builder(c, chId) : new Notification.Builder(c);
-                  b.setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
-                          .setContentTitle(in.getStringExtra("title"))
-                          .setContentText(in.getStringExtra("text"))
-                          .setCategory(Notification.CATEGORY_ALARM)
-                          .setFullScreenIntent(pi, true)
-                          .setContentIntent(pi)
-                          .setAutoCancel(true);
-                  if (Build.VERSION.SDK_INT < 26) {
-                      b.setPriority(Notification.PRIORITY_MAX).setSound(sound).setVibrate(vib);
-                  }
-                  nm.notify(id, b.build());
-
-                  try {
-                      c.startActivity(a);
+                      mp.setDataSource(getApplicationContext(), Uri.parse("android.resource://" + getPackageName() + "/raw/alarm"));
+                      mp.setLooping(true);
+                      mp.setVolume(vol, vol);
+                      mp.prepare();
+                      mp.start();
+                      h.postDelayed(ramp, 1500);
                   } catch (Exception e) {
-                      // without the overlay permission the full-screen notification above is used
                   }
+              }
+
+              private void startVibrate() {
+                  try {
+                      vib = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
+                      long[] p = new long[]{0, 500, 400, 500, 400, 500, 1500};
+                      if (vib != null) {
+                          if (Build.VERSION.SDK_INT >= 26) {
+                              vib.vibrate(VibrationEffect.createWaveform(p, 0),
+                                      new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_ALARM).build());
+                          } else {
+                              vib.vibrate(p, 0);
+                          }
+                      }
+                  } catch (Exception e) {
+                  }
+              }
+
+              private void snoozeFrom(Intent in) {
+                  try {
+                      JSONObject o = new JSONObject();
+                      o.put("id", in.getIntExtra("id", 0));
+                      o.put("at", System.currentTimeMillis() + 300000L);
+                      o.put("text", in.getStringExtra("text"));
+                      o.put("title", in.getStringExtra("title"));
+                      o.put("stop", in.getStringExtra("stop"));
+                      o.put("snooze", in.getStringExtra("snooze"));
+                      AlarmStore.add(this, o);
+                  } catch (Exception e) {
+                  }
+              }
+
+              private void cleanup() {
+                  running = false;
+                  h.removeCallbacksAndMessages(null);
+                  try {
+                      if (mp != null) {
+                          mp.stop();
+                          mp.release();
+                      }
+                  } catch (Exception e) {
+                  }
+                  mp = null;
+                  try {
+                      if (vib != null) vib.cancel();
+                  } catch (Exception e) {
+                  }
+                  try {
+                      if (wl != null && wl.isHeld()) wl.release();
+                  } catch (Exception e) {
+                  }
+              }
+
+              private void finishAlarm() {
+                  cleanup();
+                  if (AlarmActivity.current != null) AlarmActivity.current.finish();
+                  stopForeground(true);
+                  stopSelf();
+              }
+
+              @Override
+              public void onDestroy() {
+                  cleanup();
+                  super.onDestroy();
               }
           }
           '''
@@ -354,17 +571,11 @@ jobs:
           FILES['AlarmActivity'] = r'''package %PKG%;
 
           import android.app.Activity;
-          import android.app.NotificationManager;
-          import android.content.Context;
+          import android.content.Intent;
           import android.graphics.Color;
           import android.graphics.Typeface;
-          import android.media.AudioAttributes;
-          import android.media.MediaPlayer;
-          import android.net.Uri;
           import android.os.Build;
           import android.os.Bundle;
-          import android.os.VibrationEffect;
-          import android.os.Vibrator;
           import android.view.Gravity;
           import android.view.WindowManager;
           import android.widget.Button;
@@ -372,12 +583,14 @@ jobs:
           import android.widget.TextView;
           import java.text.DateFormat;
           import java.util.Date;
-          import org.json.JSONObject;
 
           public class AlarmActivity extends Activity {
-              private MediaPlayer mp;
-              private Vibrator vib;
+              static AlarmActivity current;
               private int id;
+              private String text;
+              private String title;
+              private String stop;
+              private String snooze;
 
               private int dp(int v) {
                   return (int) (v * getResources().getDisplayMetrics().density);
@@ -410,9 +623,21 @@ jobs:
                   return b;
               }
 
+              private Intent svc(String action) {
+                  Intent s = new Intent(this, AlarmService.class);
+                  s.setAction(action);
+                  s.putExtra("id", id);
+                  s.putExtra("text", text);
+                  s.putExtra("title", title);
+                  s.putExtra("stop", stop);
+                  s.putExtra("snooze", snooze);
+                  return s;
+              }
+
               @Override
               protected void onCreate(Bundle s) {
                   super.onCreate(s);
+                  current = this;
                   if (Build.VERSION.SDK_INT >= 27) {
                       setShowWhenLocked(true);
                       setTurnScreenOn(true);
@@ -423,11 +648,10 @@ jobs:
                           | WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD);
 
                   id = getIntent().getIntExtra("id", 0);
-                  final String text = nz(getIntent().getStringExtra("text"), "");
-                  final String title = nz(getIntent().getStringExtra("title"), "!");
-                  final String stop = nz(getIntent().getStringExtra("stop"), "OK");
-                  final String snooze = nz(getIntent().getStringExtra("snooze"), "+5");
-                  ((NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE)).cancel(id);
+                  text = nz(getIntent().getStringExtra("text"), "");
+                  title = nz(getIntent().getStringExtra("title"), "!");
+                  stop = nz(getIntent().getStringExtra("stop"), "OK");
+                  snooze = nz(getIntent().getStringExtra("snooze"), "+5");
 
                   LinearLayout root = new LinearLayout(this);
                   root.setOrientation(LinearLayout.VERTICAL);
@@ -445,78 +669,18 @@ jobs:
                   setContentView(root);
 
                   stopBtn.setOnClickListener(v -> {
-                      stopAll();
+                      startService(svc(AlarmService.ACT_STOP));
                       finish();
                   });
                   snoozeBtn.setOnClickListener(v -> {
-                      try {
-                          JSONObject o = new JSONObject();
-                          o.put("id", id);
-                          o.put("at", System.currentTimeMillis() + 300000L);
-                          o.put("text", text);
-                          o.put("title", title);
-                          o.put("stop", stop);
-                          o.put("snooze", snooze);
-                          AlarmStore.add(this, o);
-                      } catch (Exception e) {
-                      }
-                      stopAll();
+                      startService(svc(AlarmService.ACT_SNOOZE));
                       finish();
                   });
-
-                  startSound();
-                  startVibrate();
-              }
-
-              private void startSound() {
-                  try {
-                      mp = new MediaPlayer();
-                      mp.setAudioAttributes(new AudioAttributes.Builder()
-                              .setUsage(AudioAttributes.USAGE_ALARM)
-                              .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                              .build());
-                      mp.setDataSource(getApplicationContext(), Uri.parse("android.resource://" + getPackageName() + "/raw/alarm"));
-                      mp.setLooping(true);
-                      mp.prepare();
-                      mp.start();
-                  } catch (Exception e) {
-                  }
-              }
-
-              private void startVibrate() {
-                  try {
-                      vib = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
-                      long[] p = new long[]{0, 600, 300, 600, 300, 600, 1000};
-                      if (vib != null) {
-                          if (Build.VERSION.SDK_INT >= 26) {
-                              vib.vibrate(VibrationEffect.createWaveform(p, 0),
-                                      new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_ALARM).build());
-                          } else {
-                              vib.vibrate(p, 0);
-                          }
-                      }
-                  } catch (Exception e) {
-                  }
-              }
-
-              private void stopAll() {
-                  try {
-                      if (mp != null) {
-                          mp.stop();
-                          mp.release();
-                          mp = null;
-                      }
-                  } catch (Exception e) {
-                  }
-                  try {
-                      if (vib != null) vib.cancel();
-                  } catch (Exception e) {
-                  }
               }
 
               @Override
               protected void onDestroy() {
-                  stopAll();
+                  if (current == this) current = null;
                   super.onDestroy();
               }
           }
@@ -524,8 +688,12 @@ jobs:
 
           FILES['AlarmPlugin'] = r'''package %PKG%;
 
+          import android.app.NotificationManager;
+          import android.content.Context;
           import android.content.Intent;
           import android.net.Uri;
+          import android.os.Build;
+          import android.os.PowerManager;
           import android.provider.Settings;
           import com.getcapacitor.JSArray;
           import com.getcapacitor.JSObject;
@@ -550,17 +718,41 @@ jobs:
               }
 
               @PluginMethod
-              public void hasOverlay(PluginCall call) {
+              public void status(PluginCall call) {
+                  Context c = getContext();
                   JSObject r = new JSObject();
-                  r.put("value", Settings.canDrawOverlays(getContext()));
+                  r.put("overlay", Settings.canDrawOverlays(c));
+                  NotificationManager nm = (NotificationManager) c.getSystemService(Context.NOTIFICATION_SERVICE);
+                  r.put("notifications", nm.areNotificationsEnabled());
+                  boolean fs = true;
+                  if (Build.VERSION.SDK_INT >= 34) fs = nm.canUseFullScreenIntent();
+                  r.put("fullscreen", fs);
+                  PowerManager pm = (PowerManager) c.getSystemService(Context.POWER_SERVICE);
+                  r.put("battery", Build.VERSION.SDK_INT < 23 || pm.isIgnoringBatteryOptimizations(c.getPackageName()));
                   call.resolve(r);
               }
 
               @PluginMethod
-              public void requestOverlay(PluginCall call) {
-                  Intent i = new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + getContext().getPackageName()));
+              public void openSettings(PluginCall call) {
+                  String t = call.getString("type", "");
+                  Context c = getContext();
+                  String pkg = c.getPackageName();
+                  Intent i;
+                  if ("overlay".equals(t)) {
+                      i = new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + pkg));
+                  } else if ("fullscreen".equals(t) && Build.VERSION.SDK_INT >= 34) {
+                      i = new Intent(Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT, Uri.parse("package:" + pkg));
+                  } else if ("battery".equals(t)) {
+                      i = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:" + pkg));
+                  } else {
+                      i = new Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS);
+                      i.putExtra(Settings.EXTRA_APP_PACKAGE, pkg);
+                  }
                   i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-                  getContext().startActivity(i);
+                  try {
+                      c.startActivity(i);
+                  } catch (Exception e) {
+                  }
                   call.resolve();
               }
           }
@@ -578,6 +770,7 @@ jobs:
                           <action android:name="android.intent.action.BOOT_COMPLETED" />
                       </intent-filter>
                   </receiver>
+                  <service android:name="%PKG%.AlarmService" android:exported="false" android:foregroundServiceType="mediaPlayback" />
                   <activity android:name="%PKG%.AlarmActivity" android:exported="false" android:excludeFromRecents="true" android:showWhenLocked="true" android:turnScreenOn="true" android:theme="@android:style/Theme.Material.NoActionBar" />
           '''.replace('%PKG%', pkg)
           if 'AlarmReceiver' not in m:
