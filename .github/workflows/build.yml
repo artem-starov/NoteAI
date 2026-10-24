@@ -197,6 +197,7 @@ jobs:
                   i.putExtra("title", o.optString("title"));
                   i.putExtra("stop", o.optString("stop"));
                   i.putExtra("snooze", o.optString("snooze"));
+                  i.putExtra("silent", o.optInt("silent"));
                   return PendingIntent.getBroadcast(c, o.optInt("id"), i, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
               }
 
@@ -360,6 +361,7 @@ jobs:
               private String title;
               private String stop;
               private String snooze;
+              private int silent;
 
               private final Runnable ramp = new Runnable() {
                   @Override
@@ -392,6 +394,7 @@ jobs:
                   i.putExtra("title", title);
                   i.putExtra("stop", stop);
                   i.putExtra("snooze", snooze);
+                  i.putExtra("silent", silent);
                   return i;
               }
 
@@ -451,6 +454,7 @@ jobs:
                   title = in.getStringExtra("title");
                   stop = in.getStringExtra("stop");
                   snooze = in.getStringExtra("snooze");
+                  silent = in.getIntExtra("silent", 0);
                   if (title == null) title = "!";
                   if (text == null) text = "";
                   if (stop == null) stop = "OK";
@@ -465,7 +469,7 @@ jobs:
                   if (!running) {
                       running = true;
                       wake();
-                      startSound();
+                      if (silent == 0) startSound();
                       startVibrate();
                       h.postDelayed(autoStop, 300000L);
                   }
@@ -527,6 +531,7 @@ jobs:
                       o.put("title", in.getStringExtra("title"));
                       o.put("stop", in.getStringExtra("stop"));
                       o.put("snooze", in.getStringExtra("snooze"));
+                      o.put("silent", in.getIntExtra("silent", 0));
                       AlarmStore.add(this, o);
                   } catch (Exception e) {
                   }
@@ -591,6 +596,7 @@ jobs:
               private String title;
               private String stop;
               private String snooze;
+              private int silent;
 
               private int dp(int v) {
                   return (int) (v * getResources().getDisplayMetrics().density);
@@ -631,6 +637,7 @@ jobs:
                   s.putExtra("title", title);
                   s.putExtra("stop", stop);
                   s.putExtra("snooze", snooze);
+                  s.putExtra("silent", silent);
                   return s;
               }
 
@@ -652,6 +659,7 @@ jobs:
                   title = nz(getIntent().getStringExtra("title"), "!");
                   stop = nz(getIntent().getStringExtra("stop"), "OK");
                   snooze = nz(getIntent().getStringExtra("snooze"), "+5");
+                  silent = getIntent().getIntExtra("silent", 0);
 
                   LinearLayout root = new LinearLayout(this);
                   root.setOrientation(LinearLayout.VERTICAL);
