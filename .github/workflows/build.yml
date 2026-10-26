@@ -1,7 +1,13 @@
-name: Build NoteAI APK
+name: Build NoteAI (APK and Google Play bundle)
 
 on:
   workflow_dispatch:
+    inputs:
+      target:
+        description: 'apk = release for friends on GitHub; play = signed bundle (AAB) for Google Play'
+        type: choice
+        options: [apk, play]
+        default: apk
   push:
     branches: [main]
 
@@ -10,6 +16,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      TARGET: ${{ github.event.inputs.target || 'apk' }}
     steps:
       - uses: actions/setup-node@v4
         with:
@@ -31,16 +39,15 @@ jobs:
             "version": "1.5.0",
             "private": true,
             "dependencies": {
-              "@capacitor/android": "^7.0.0",
-              "@capacitor/app": "^7.0.0",
-              "@capacitor/browser": "^7.0.0",
-              "@capacitor/cli": "^7.0.0",
-              "@capacitor/core": "^7.0.0",
-              "@capacitor/local-notifications": "^7.0.0"
+              "@capacitor/android": "^8.0.0",
+              "@capacitor/app": "^8.0.0",
+              "@capacitor/browser": "^8.0.0",
+              "@capacitor/cli": "^8.0.0",
+              "@capacitor/core": "^8.0.0"
             }
           }
           EOF
-          cat > capacitor.config.json <<'EOF'
+          cat > config.apk.json <<'EOF'
           {
             "appId": "com.noteai.app",
             "appName": "NoteAI",
@@ -53,10 +60,25 @@ jobs:
             "android": { "backgroundColor": "#070b14" }
           }
           EOF
+          cat > config.play.json <<'EOF'
+          {
+            "appId": "com.noteai.app",
+            "appName": "NoteAI",
+            "webDir": "www",
+            "server": { "androidScheme": "https" },
+            "android": { "backgroundColor": "#070b14", "appendUserAgent": "NoteAIPlay" }
+          }
+          EOF
+          cp config.$TARGET.json capacitor.config.json
           mkdir www
           cat > www/index.html <<'EOF'
           <!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>NoteAI</title></head><body style="background:#070b14;color:#e8f1ff;font-family:sans-serif;text-align:center;padding-top:30vh">NoteAI</body></html>
           EOF
+          if [ "$TARGET" = "play" ]; then
+            for f in index.html manifest.json icon-192.png icon-512.png privacy.html delete-account.html; do
+              curl -fsSL "https://nouteai-prodject.web.app/$f" -o "www/$f"
+            done
+          fi
           npm install
           npx cap add android
 
@@ -131,10 +153,34 @@ jobs:
           # ---- permissions for exact alarms, notifications and vibration
           p = 'android/app/src/main/AndroidManifest.xml'
           s = open(p, encoding='utf-8').read()
-          perms = ['POST_NOTIFICATIONS', 'VIBRATE', 'WAKE_LOCK', 'RECEIVE_BOOT_COMPLETED', 'USE_EXACT_ALARM', 'SCHEDULE_EXACT_ALARM', 'USE_FULL_SCREEN_INTENT', 'SYSTEM_ALERT_WINDOW', 'FOREGROUND_SERVICE', 'FOREGROUND_SERVICE_MEDIA_PLAYBACK', 'REQUEST_IGNORE_BATTERY_OPTIMIZATIONS', 'REQUEST_INSTALL_PACKAGES']
-          add = ''.join('    <uses-permission android:name="android.permission.%s" />\n' % x for x in perms if 'permission.%s"' % x not in s)
+          play = os.environ.get('TARGET') == 'play'
+          perms = ['POST_NOTIFICATIONS', 'VIBRATE', 'WAKE_LOCK', 'RECEIVE_BOOT_COMPLETED', 'USE_EXACT_ALARM', 'USE_FULL_SCREEN_INTENT', 'FOREGROUND_SERVICE', 'FOREGROUND_SERVICE_MEDIA_PLAYBACK']
+          if play:
+              perms.append('SCHEDULE_EXACT_ALARM:32')
+          else:
+              perms += ['SCHEDULE_EXACT_ALARM', 'SYSTEM_ALERT_WINDOW', 'REQUEST_IGNORE_BATTERY_OPTIMIZATIONS', 'REQUEST_INSTALL_PACKAGES']
+          add = ''
+          for x in perms:
+              name, _, mx = x.partition(':')
+              if 'permission.%s"' % name not in s:
+                  add += '    <uses-permission android:name="android.permission.%s"%s />\n' % (name, (' android:maxSdkVersion="%s"' % mx) if mx else '')
           s = s.replace('</manifest>', add + '</manifest>')
           open(p, 'w', encoding='utf-8').write(s)
+
+          # ---- release signing for the Google Play bundle
+          if play:
+              t = open(g, encoding='utf-8').read()
+              sign = ("    signingConfigs {\n        release {\n"
+                      "            storeFile file(System.getenv('UPLOAD_KS'))\n"
+                      "            storePassword System.getenv('UPLOAD_STORE_PASSWORD')\n"
+                      "            keyAlias System.getenv('UPLOAD_KEY_ALIAS')\n"
+                      "            keyPassword System.getenv('UPLOAD_KEY_PASSWORD')\n"
+                      "        }\n    }\n")
+              old = "    buildTypes {\n        release {\n"
+              assert old in t, 'buildTypes block not found'
+              t = t.replace(old, sign + old + "            signingConfig signingConfigs.release\n")
+              open(g, 'w', encoding='utf-8').write(t)
+              print('release signing configured')
           PY
 
       - name: Add native alarm (full-screen alarm with vibration)
@@ -709,6 +755,9 @@ jobs:
           import com.getcapacitor.PluginCall;
           import com.getcapacitor.PluginMethod;
           import com.getcapacitor.annotation.CapacitorPlugin;
+          import com.getcapacitor.annotation.Permission;
+          import com.getcapacitor.annotation.PermissionCallback;
+          import android.Manifest;
           import androidx.core.content.FileProvider;
           import java.io.File;
           import java.io.FileOutputStream;
@@ -716,8 +765,22 @@ jobs:
           import java.net.HttpURLConnection;
           import java.net.URL;
 
-          @CapacitorPlugin(name = "NativeAlarm")
+          @CapacitorPlugin(name = "NativeAlarm", permissions = {@Permission(strings = {Manifest.permission.POST_NOTIFICATIONS}, alias = "notif")})
           public class AlarmPlugin extends Plugin {
+              @PluginMethod
+              public void requestNotifications(PluginCall call) {
+                  if (Build.VERSION.SDK_INT >= 33) {
+                      requestPermissionForAlias("notif", call, "notifDone");
+                  } else {
+                      call.resolve();
+                  }
+              }
+
+              @PermissionCallback
+              private void notifDone(PluginCall call) {
+                  call.resolve();
+              }
+
               @PluginMethod
               public void sync(PluginCall call) {
                   JSArray arr = call.getArray("alarms");
@@ -885,6 +948,7 @@ jobs:
           PY
 
       - name: Use fixed signing key (so updates install over old versions)
+        if: env.TARGET != 'play'
         env:
           KS: ${{ secrets.DEBUG_KEYSTORE_B64 }}
         run: |
@@ -896,7 +960,36 @@ jobs:
             echo "No DEBUG_KEYSTORE_B64 secret: using a temporary key"
           fi
 
+      - name: Prepare Google Play upload key
+        if: env.TARGET == 'play'
+        env:
+          UPLOAD_KEYSTORE_B64: ${{ secrets.UPLOAD_KEYSTORE_B64 }}
+        run: |
+          test -n "$UPLOAD_KEYSTORE_B64" || { echo "Missing secret UPLOAD_KEYSTORE_B64"; exit 1; }
+          echo "$UPLOAD_KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/upload.keystore"
+          echo "UPLOAD_KS=$RUNNER_TEMP/upload.keystore" >> "$GITHUB_ENV"
+
+      - name: Build Google Play bundle (AAB)
+        if: env.TARGET == 'play'
+        working-directory: app
+        env:
+          UPLOAD_STORE_PASSWORD: ${{ secrets.UPLOAD_STORE_PASSWORD }}
+          UPLOAD_KEY_ALIAS: ${{ secrets.UPLOAD_KEY_ALIAS }}
+          UPLOAD_KEY_PASSWORD: ${{ secrets.UPLOAD_KEY_PASSWORD }}
+        run: |
+          npx cap sync android
+          cd android
+          chmod +x gradlew
+          ./gradlew bundleRelease --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        if: env.TARGET == 'play'
+        with:
+          name: NoteAI-play-aab
+          path: app/android/app/build/outputs/bundle/release/app-release.aab
+
       - name: Build APK
+        if: env.TARGET != 'play'
         working-directory: app
         run: |
           npx cap sync android
@@ -905,14 +998,17 @@ jobs:
           ./gradlew assembleDebug --no-daemon
 
       - uses: actions/upload-artifact@v4
+        if: env.TARGET != 'play'
         with:
           name: NoteAI-apk
           path: app/android/app/build/outputs/apk/debug/app-debug.apk
 
       - name: Prepare release file
+        if: env.TARGET != 'play'
         run: cp app/android/app/build/outputs/apk/debug/app-debug.apk NoteAI.apk
 
       - uses: softprops/action-gh-release@v2
+        if: env.TARGET != 'play'
         with:
           tag_name: build-${{ github.run_number }}
           name: NoteAI build ${{ github.run_number }}
