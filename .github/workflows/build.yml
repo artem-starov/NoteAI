@@ -760,6 +760,9 @@ jobs:
           import android.Manifest;
           import androidx.core.content.FileProvider;
           import java.io.File;
+          import android.content.pm.PackageInfo;
+          import android.content.pm.PackageManager;
+          import android.content.pm.Signature;
           import java.io.FileOutputStream;
           import java.io.InputStream;
           import java.net.HttpURLConnection;
@@ -833,6 +836,35 @@ jobs:
                   call.resolve();
               }
 
+              @PluginMethod
+              public void latestBuild(PluginCall call) {
+                  try {
+                      HttpURLConnection c = (HttpURLConnection) new URL("https://github.com/artem-starov/NoteAI/releases/latest").openConnection();
+                      c.setInstanceFollowRedirects(false);
+                      c.setConnectTimeout(10000);
+                      c.setReadTimeout(10000);
+                      c.connect();
+                      String loc = c.getHeaderField("Location");
+                      c.disconnect();
+                      int n = 0;
+                      int k = loc == null ? -1 : loc.lastIndexOf("build-");
+                      if (k >= 0) {
+                          int j = k + 6;
+                          while (j < loc.length() && Character.isDigit(loc.charAt(j))) j++;
+                          try {
+                              n = Integer.parseInt(loc.substring(k + 6, j));
+                          } catch (Exception e) {
+                              n = 0;
+                          }
+                      }
+                      JSObject r = new JSObject();
+                      r.put("build", n);
+                      call.resolve(r);
+                  } catch (Exception e) {
+                      call.reject("net");
+                  }
+              }
+
               private static boolean busy = false;
 
               @PluginMethod
@@ -894,6 +926,38 @@ jobs:
                   if (!f.exists()) {
                       call.reject("no file");
                       return;
+                  }
+                  try {
+                      PackageManager pm = c.getPackageManager();
+                      int fl = Build.VERSION.SDK_INT >= 28 ? PackageManager.GET_SIGNING_CERTIFICATES : PackageManager.GET_SIGNATURES;
+                      PackageInfo ni = pm.getPackageArchiveInfo(f.getAbsolutePath(), fl);
+                      PackageInfo oi = pm.getPackageInfo(c.getPackageName(), fl);
+                      if (ni != null && oi != null) {
+                          long nv = Build.VERSION.SDK_INT >= 28 ? ni.getLongVersionCode() : ni.versionCode;
+                          long ov = Build.VERSION.SDK_INT >= 28 ? oi.getLongVersionCode() : oi.versionCode;
+                          if (nv <= ov) {
+                              r.put("reason", "same");
+                              call.resolve(r);
+                              return;
+                          }
+                          Signature[] ns = null;
+                          Signature[] os = null;
+                          if (Build.VERSION.SDK_INT >= 28) {
+                              if (ni.signingInfo != null && oi.signingInfo != null) {
+                                  ns = ni.signingInfo.getApkContentsSigners();
+                                  os = oi.signingInfo.getApkContentsSigners();
+                              }
+                          } else {
+                              ns = ni.signatures;
+                              os = oi.signatures;
+                          }
+                          if (ns != null && os != null && ns.length > 0 && os.length > 0 && !ns[0].equals(os[0])) {
+                              r.put("reason", "signature");
+                              call.resolve(r);
+                              return;
+                          }
+                      }
+                  } catch (Exception e) {
                   }
                   if (Build.VERSION.SDK_INT >= 26 && !c.getPackageManager().canRequestPackageInstalls()) {
                       Intent s = new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:" + c.getPackageName()));
