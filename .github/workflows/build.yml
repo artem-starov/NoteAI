@@ -36,7 +36,7 @@ jobs:
           cat > package.json <<'EOF'
           {
             "name": "noteai-app",
-            "version": "1.5.0",
+            "version": "2.1.0",
             "private": true,
             "dependencies": {
               "@capacitor/android": "^8.0.0",
@@ -146,7 +146,7 @@ jobs:
           t = open(g, encoding='utf-8').read()
           run = os.environ.get('RUN_NUMBER', '1')
           t2 = re.sub(r'versionCode\s+\d+', 'versionCode ' + run, t)
-          t2 = re.sub(r'versionName\s+"[^"]*"', 'versionName "1.' + run + '"', t2)
+          t2 = re.sub(r'versionName\s+"[^"]*"', 'versionName "2.1.' + run + '"', t2)
           open(g, 'w', encoding='utf-8').write(t2)
           print('versionCode set to ' + run if t2 != t else 'WARNING: versionCode was not changed')
 
